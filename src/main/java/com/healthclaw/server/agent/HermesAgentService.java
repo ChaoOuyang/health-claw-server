@@ -2,6 +2,8 @@ package com.healthclaw.server.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import com.healthclaw.server.dto.DailyCommentRequest;
 import com.healthclaw.server.dto.ExerciseParseResponse;
 import com.healthclaw.server.dto.FoodParseResponse;
@@ -19,6 +21,8 @@ import java.util.List;
 @Service
 public class HermesAgentService {
 
+    private static final Logger log = LoggerFactory.getLogger(HermesAgentService.class);
+
     private final AiService aiService;
     private final FoodRecordService foodService;
     private final ExerciseRecordService exerciseService;
@@ -30,10 +34,12 @@ public class HermesAgentService {
             你是健康记录助手，分析用户输入的意图，返回严格 JSON，不含其他文字。
 
             意图类型（intent 字段）：
-            - FOOD_RECORD：记录饮食
+            - FOOD_RECORD：记录饮食（包括同时提到多个餐次的情况）
             - EXERCISE_RECORD：记录运动
             - FOOD_AND_EXERCISE：同时包含饮食和运动
             - WEIGHT_RECORD：记录体重
+            - DELETE_FOOD：删除某条饮食记录（含"删掉""去掉""取消""撤销"等词，且指向食物）
+            - DELETE_EXERCISE：删除某条运动记录（含"删掉""去掉""取消""撤销"等词，且指向运动）
             - QUERY_TODAY：查询今日数据
             - DAILY_COMMENT：请求 AI 点评/总结
             - UNKNOWN：无法识别
@@ -41,10 +47,11 @@ public class HermesAgentService {
             返回格式：
             {
               "intent": "...",
-              "food_text": "饮食相关描述，无则null",
+              "food_text": "完整的饮食描述原文（保留所有餐次和食物信息），无则null",
               "exercise_text": "运动相关描述，无则null",
-              "meal_type": "BREAKFAST|LUNCH|DINNER|SNACK，根据时间词推断，不明确则null",
-              "weight_kg": 体重数值或null
+              "meal_type": "仅当所有食物属于同一餐次时填写 BREAKFAST|LUNCH|DINNER|SNACK，涉及多个餐次则填null",
+              "weight_kg": 体重数值或null,
+              "delete_keyword": "删除时提取的关键词，如'牛肉面'或'跑步'，无则null"
             }
 
             只返回 JSON，不含任何其他内容。
@@ -69,6 +76,7 @@ public class HermesAgentService {
             intent.setRawMessage(message);
             return route(intent, date);
         } catch (Exception e) {
+            log.error("Agent process failed for message='{}': {}", message, e.getMessage(), e);
             return AgentResponse.of("UNKNOWN", "抱歉，我没理解你说的，可以换个方式再说一次吗？");
         }
     }
@@ -85,6 +93,7 @@ public class HermesAgentService {
         result.setFoodText(nullIfEmpty(node.path("food_text").asText(null)));
         result.setExerciseText(nullIfEmpty(node.path("exercise_text").asText(null)));
         result.setMealType(nullIfEmpty(node.path("meal_type").asText(null)));
+        result.setDeleteKeyword(nullIfEmpty(node.path("delete_keyword").asText(null)));
         if (!node.path("weight_kg").isMissingNode() && !node.path("weight_kg").isNull()) {
             result.setWeightKg(node.path("weight_kg").asDouble());
         }
@@ -97,6 +106,8 @@ public class HermesAgentService {
             case "EXERCISE_RECORD" -> handleExercise(intent, date);
             case "FOOD_AND_EXERCISE" -> handleFoodAndExercise(intent, date);
             case "WEIGHT_RECORD" -> handleWeight(intent, date);
+            case "DELETE_FOOD" -> handleDeleteFood(intent, date);
+            case "DELETE_EXERCISE" -> handleDeleteExercise(intent, date);
             case "QUERY_TODAY" -> handleQueryToday(date);
             case "DAILY_COMMENT" -> handleDailyComment(date);
             default -> AgentResponse.of("UNKNOWN", "没听清楚，可以说'记录午饭吃了什么'或者'今天跑了多久'？");
@@ -106,10 +117,11 @@ public class HermesAgentService {
     private AgentResponse handleFood(IntentResult intent, String date) throws Exception {
         String text = intent.getFoodText() != null ? intent.getFoodText() : intent.getRawMessage();
         List<FoodParseResponse> foods = aiService.parseFoodList(text);
-        if (foods.isEmpty()) return AgentResponse.of("FOOD_RECORD", "没解析出食物，可以说得更具体吗？");
+        if (foods.isEmpty()) return AgentResponse.of("FOOD_RECORD", "没解析出食物，可以说得更具体吗？", "识别到饮食意图，但解析结果为空");
 
         int total = 0;
         StringBuilder sb = new StringBuilder();
+        StringBuilder reasoning = new StringBuilder("识别到饮食记录意图，解析出 " + foods.size() + " 项：");
         for (FoodParseResponse f : foods) {
             FoodRecord record = new FoodRecord();
             record.setRecordDate(date);
@@ -122,21 +134,27 @@ public class HermesAgentService {
             record.setCaloriesMaxKcal(f.getCaloriesMaxKcal());
             record.setFuzzy(f.isFuzzy());
             record.setKjValue(f.getKjValue());
+            record.setProtein(f.getProtein());
+            record.setCarbs(f.getCarbs());
+            record.setFat(f.getFat());
             foodService.save(record);
             total += f.getCaloriesKcal();
             sb.append(f.getFoodName()).append("(").append(f.getCaloriesKcal()).append("kcal) ");
+            reasoning.append(f.getFoodName()).append(" ≈ ").append(f.getCaloriesKcal()).append("kcal；");
         }
         return AgentResponse.of("FOOD_RECORD",
-                "已记录：" + sb.toString().trim() + "，合计 " + total + " kcal ✓");
+                "已记录：" + sb.toString().trim() + "，合计 " + total + " kcal ✓",
+                reasoning.toString());
     }
 
     private AgentResponse handleExercise(IntentResult intent, String date) throws Exception {
         String text = intent.getExerciseText() != null ? intent.getExerciseText() : intent.getRawMessage();
         List<ExerciseParseResponse> exercises = aiService.parseExerciseList(text);
-        if (exercises.isEmpty()) return AgentResponse.of("EXERCISE_RECORD", "没解析出运动，可以说得更具体吗？");
+        if (exercises.isEmpty()) return AgentResponse.of("EXERCISE_RECORD", "没解析出运动，可以说得更具体吗？", "识别到运动意图，但解析结果为空");
 
         int total = 0;
         StringBuilder sb = new StringBuilder();
+        StringBuilder reasoning = new StringBuilder("识别到运动记录意图，解析出 " + exercises.size() + " 项：");
         for (ExerciseParseResponse e : exercises) {
             ExerciseRecord record = new ExerciseRecord();
             record.setRecordDate(date);
@@ -148,27 +166,32 @@ public class HermesAgentService {
             exerciseService.save(record);
             total += e.getCaloriesBurnedKcal();
             sb.append(e.getExerciseName()).append(" ").append(e.getDurationMinutes()).append("min ");
+            reasoning.append(e.getExerciseName()).append(" ").append(e.getDurationMinutes()).append("min ≈ ").append(e.getCaloriesBurnedKcal()).append("kcal；");
         }
         return AgentResponse.of("EXERCISE_RECORD",
-                "已记录：" + sb.toString().trim() + "，消耗 " + total + " kcal ✓");
+                "已记录：" + sb.toString().trim() + "，消耗 " + total + " kcal ✓",
+                reasoning.toString());
     }
 
     private AgentResponse handleFoodAndExercise(IntentResult intent, String date) throws Exception {
         AgentResponse foodResp = handleFood(intent, date);
         AgentResponse exResp = handleExercise(intent, date);
-        return AgentResponse.of("FOOD_AND_EXERCISE", foodResp.getReply() + "\n" + exResp.getReply());
+        return AgentResponse.of("FOOD_AND_EXERCISE",
+                foodResp.getReply() + "\n" + exResp.getReply(),
+                foodResp.getReasoning() + "\n" + exResp.getReasoning());
     }
 
     private AgentResponse handleWeight(IntentResult intent, String date) {
         if (intent.getWeightKg() == null) {
-            return AgentResponse.of("WEIGHT_RECORD", "没听到体重数值，可以说'今天体重 65.5 公斤'？");
+            return AgentResponse.of("WEIGHT_RECORD", "没听到体重数值，可以说'今天体重 65.5 公斤'？", "识别到体重记录意图，但未提取到数值");
         }
         WeightRecord record = new WeightRecord();
         record.setRecordDate(date);
         record.setWeightKg((float) intent.getWeightKg().doubleValue());
         weightService.upsert(record);
         return AgentResponse.of("WEIGHT_RECORD",
-                "已记录今日体重 " + intent.getWeightKg() + " kg ✓");
+                "已记录今日体重 " + intent.getWeightKg() + " kg ✓",
+                "识别到体重记录意图，提取数值 " + intent.getWeightKg() + " kg，写入 " + date);
     }
 
     private AgentResponse handleQueryToday(String date) {
@@ -180,7 +203,8 @@ public class HermesAgentService {
         int gap = bmr + burned - intake;
         String gapText = gap >= 0 ? "热量缺口 " + gap + " kcal" : "热量盈余 " + (-gap) + " kcal";
         return AgentResponse.of("QUERY_TODAY",
-                "今日摄入 " + intake + " kcal，运动消耗 " + burned + " kcal，目标 " + goal + " kcal，" + gapText);
+                "今日摄入 " + intake + " kcal，运动消耗 " + burned + " kcal，目标 " + goal + " kcal，" + gapText,
+                "查询今日数据：摄入=" + intake + " 消耗=" + burned + " BMR=" + bmr);
     }
 
     private AgentResponse handleDailyComment(String date) throws Exception {
@@ -194,7 +218,77 @@ public class HermesAgentService {
         req.setWeightKg(profile.getCurrentWeightKg());
         req.setTargetWeightKg(profile.getTargetWeightKg());
         String comment = aiService.generateDailyComment(req);
-        return AgentResponse.of("DAILY_COMMENT", comment);
+        return AgentResponse.of("DAILY_COMMENT", comment,
+                "生成每日点评，摄入=" + intake + " 消耗=" + burned);
+    }
+
+    private AgentResponse handleDeleteFood(IntentResult intent, String date) throws Exception {
+        List<FoodRecord> foods = foodService.getByDate(date);
+        if (foods.isEmpty()) {
+            return AgentResponse.of("DELETE_FOOD", "今日暂无饮食记录", "今日无饮食记录可删除");
+        }
+        // 构建记录列表传给 LLM 决策
+        StringBuilder listDesc = new StringBuilder();
+        for (FoodRecord f : foods) {
+            listDesc.append("id=").append(f.getId()).append(" 名称=").append(f.getFoodName())
+                    .append(" 餐次=").append(f.getMealType()).append("；");
+        }
+        String systemPrompt = "你是健康记录助手。根据用户说的话，从以下今日饮食记录中选出要删除的条目，返回严格 JSON：{\"ids\":[id1,id2,...],\"reason\":\"简短说明\"}，只返回 JSON。\n今日记录：" + listDesc;
+        String raw = aiService.chatRaw(systemPrompt, intent.getRawMessage(), 0.1f, 200);
+        int start = raw.indexOf('{'); int end = raw.lastIndexOf('}');
+        if (start < 0 || end <= start) return AgentResponse.of("DELETE_FOOD", "AI 决策失败，请重试", "LLM 返回格式异常：" + raw);
+
+        JsonNode node = mapper.readTree(raw.substring(start, end + 1));
+        String reason = node.path("reason").asText("AI 决策删除");
+        JsonNode idsNode = node.path("ids");
+        if (!idsNode.isArray() || idsNode.isEmpty()) {
+            return AgentResponse.of("DELETE_FOOD", "没找到匹配的饮食记录", "AI 决策：" + reason);
+        }
+        StringBuilder deleted = new StringBuilder();
+        for (JsonNode idNode : idsNode) {
+            long id = idNode.asLong();
+            foods.stream().filter(f -> f.getId() == id).findFirst().ifPresent(f -> {
+                foodService.delete(f.getId());
+                deleted.append(f.getFoodName()).append(" ");
+            });
+        }
+        return AgentResponse.of("DELETE_FOOD",
+                "已删除：" + deleted.toString().trim() + " ✓",
+                "AI 决策：" + reason);
+    }
+
+    private AgentResponse handleDeleteExercise(IntentResult intent, String date) throws Exception {
+        List<ExerciseRecord> exercises = exerciseService.getByDate(date);
+        if (exercises.isEmpty()) {
+            return AgentResponse.of("DELETE_EXERCISE", "今日暂无运动记录", "今日无运动记录可删除");
+        }
+        StringBuilder listDesc = new StringBuilder();
+        for (ExerciseRecord e : exercises) {
+            listDesc.append("id=").append(e.getId()).append(" 名称=").append(e.getExerciseName())
+                    .append(" 时长=").append(e.getDurationMinutes()).append("min；");
+        }
+        String systemPrompt = "你是健康记录助手。根据用户说的话，从以下今日运动记录中选出要删除的条目，返回严格 JSON：{\"ids\":[id1,id2,...],\"reason\":\"简短说明\"}，只返回 JSON。\n今日记录：" + listDesc;
+        String raw = aiService.chatRaw(systemPrompt, intent.getRawMessage(), 0.1f, 200);
+        int start = raw.indexOf('{'); int end = raw.lastIndexOf('}');
+        if (start < 0 || end <= start) return AgentResponse.of("DELETE_EXERCISE", "AI 决策失败，请重试", "LLM 返回格式异常：" + raw);
+
+        JsonNode node = mapper.readTree(raw.substring(start, end + 1));
+        String reason = node.path("reason").asText("AI 决策删除");
+        JsonNode idsNode = node.path("ids");
+        if (!idsNode.isArray() || idsNode.isEmpty()) {
+            return AgentResponse.of("DELETE_EXERCISE", "没找到匹配的运动记录", "AI 决策：" + reason);
+        }
+        StringBuilder deleted = new StringBuilder();
+        for (JsonNode idNode : idsNode) {
+            long id = idNode.asLong();
+            exercises.stream().filter(e -> e.getId() == id).findFirst().ifPresent(e -> {
+                exerciseService.delete(e.getId());
+                deleted.append(e.getExerciseName()).append(" ");
+            });
+        }
+        return AgentResponse.of("DELETE_EXERCISE",
+                "已删除：" + deleted.toString().trim() + " ✓",
+                "AI 决策：" + reason);
     }
 
     private String resolveMealType(String fromAi, String fromIntent) {

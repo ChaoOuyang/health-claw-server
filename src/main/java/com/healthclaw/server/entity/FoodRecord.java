@@ -27,5 +27,8 @@ public class FoodRecord {
     private int caloriesMaxKcal;
     private boolean fuzzy;
     private float kjValue;
+    private double protein;
+    private double carbs;
+    private double fat;
     private long recordTimestamp = System.currentTimeMillis();
 }

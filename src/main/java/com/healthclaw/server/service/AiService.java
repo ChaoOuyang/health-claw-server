@@ -28,8 +28,9 @@ public class AiService {
     private String model;
 
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(40, TimeUnit.SECONDS)
             .build();
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -68,10 +69,11 @@ public class AiService {
 
     public List<FoodParseResponse> parseFoodList(String userInput) throws IOException {
         String systemPrompt = """
-                你是专业营养分析助手。用户可能描述了一餐或多种食物，请逐一解析，返回严格 JSON 数组，不含其他文字。
+                你是专业营养分析助手。用户可能描述了一餐或多个餐次的食物，请逐一解析每种食物，返回严格 JSON 数组，不含其他文字。
                 每个元素格式：{"food_name":"名称","quantity":"数量","calories_kcal":数值,"calories_min_kcal":最小,"calories_max_kcal":最大,"kj_value":kJ数值,"is_fuzzy":true或false,"confidence":"HIGH或MEDIUM或LOW","protein_g":蛋白质克数,"carbs_g":碳水化合物克数,"fat_g":脂肪克数,"meal_type":"餐次"}
-                meal_type 根据用户描述中的时间词推断：早上/早餐→BREAKFAST，中午/午餐→LUNCH，下午茶/加餐→SNACK，晚上/晚餐→DINNER，不明确则→BREAKFAST。
-                描述模糊时 is_fuzzy=true。protein_g/carbs_g/fat_g 为该份量估算克数。只返回 JSON 数组，如 [{...},{...}]。""";
+                meal_type 必须根据每种食物所属的餐次单独判断：早上/早餐→BREAKFAST，中午/午餐→LUNCH，下午茶/加餐→SNACK，晚上/晚餐→DINNER，不明确则→BREAKFAST。
+                同一段描述中不同餐次的食物必须分别设置各自的 meal_type，不可统一设为同一餐次。
+                描述模糊时 is_fuzzy=true。protein_g/carbs_g/fat_g 为该份量估算克数，不可为0，必须给出合理估算值。只返回 JSON 数组，如 [{...},{...}]。""";
 
         String content = chat(systemPrompt, userInput, 0.2f, 600);
         int start = content.indexOf('[');
