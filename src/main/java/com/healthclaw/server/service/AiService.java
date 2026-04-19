@@ -27,6 +27,9 @@ public class AiService {
     @Value("${zhipu.model}")
     private String model;
 
+    @Value("${zhipu.model.vision}")
+    private String visionModel;
+
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -68,6 +71,10 @@ public class AiService {
     }
 
     public List<FoodParseResponse> parseFoodList(String userInput) throws IOException {
+        return parseFoodList(userInput, "");
+    }
+
+    public List<FoodParseResponse> parseFoodList(String userInput, String referenceHint) throws IOException {
         String systemPrompt = """
                 你是专业营养分析助手。用户可能描述了一餐或多个餐次的食物，请逐一解析每种食物，返回严格 JSON 数组，不含其他文字。
                 每个元素格式：{"food_name":"名称","quantity":"数量","calories_kcal":数值,"calories_min_kcal":最小,"calories_max_kcal":最大,"kj_value":kJ数值,"is_fuzzy":true或false,"confidence":"HIGH或MEDIUM或LOW","protein_g":蛋白质克数,"carbs_g":碳水化合物克数,"fat_g":脂肪克数,"meal_type":"餐次"}
@@ -75,7 +82,8 @@ public class AiService {
                 同一段描述中不同餐次的食物必须分别设置各自的 meal_type，不可统一设为同一餐次。
                 描述模糊时 is_fuzzy=true。protein_g/carbs_g/fat_g 为该份量估算克数，不可为0，必须给出合理估算值。只返回 JSON 数组，如 [{...},{...}]。""";
 
-        String content = chat(systemPrompt, userInput, 0.2f, 600);
+        String prompt = referenceHint.isBlank() ? userInput : referenceHint + "\n用户输入：" + userInput;
+        String content = chat(systemPrompt, prompt, 0.2f, 600);
         int start = content.indexOf('[');
         int end = content.lastIndexOf(']');
         if (start < 0 || end <= start) throw new IOException("AI 返回格式错误: " + content);
@@ -143,6 +151,70 @@ public class AiService {
                 profile.getCurrentWeightKg(), profile.getTargetWeightKg(),
                 profile.getEffectiveDailyGoal());
         return chat(systemPrompt, userPrompt, 0.7f, 300).trim();
+    }
+
+    public List<FoodParseResponse> parseFoodFromImage(String imageBase64, String hintMealType) throws IOException {
+        String systemPrompt = """
+                你是专业营养分析助手。请识别图中所有食物，逐一估算热量，返回严格 JSON 数组，不含其他文字。
+                每个元素格式：{"food_name":"名称","quantity":"数量","calories_kcal":数值,"calories_min_kcal":最小,"calories_max_kcal":最大,"kj_value":kJ数值,"is_fuzzy":true或false,"confidence":"HIGH或MEDIUM或LOW","protein_g":蛋白质克数,"carbs_g":碳水化合物克数,"fat_g":脂肪克数,"meal_type":"餐次"}
+                meal_type 若无法判断则使用传入的默认餐次。只返回 JSON 数组，如 [{...},{...}]。""";
+        String userText = "请识别图中所有食物并估算热量，默认餐次为：" + hintMealType;
+        String content = chatWithImage(systemPrompt, userText, imageBase64);
+        int start = content.indexOf('[');
+        int end = content.lastIndexOf(']');
+        if (start < 0 || end <= start) throw new IOException("AI 返回格式错误: " + content);
+
+        JsonNode arr = mapper.readTree(content.substring(start, end + 1));
+        List<FoodParseResponse> result = new ArrayList<>();
+        for (JsonNode obj : arr) {
+            FoodParseResponse resp = new FoodParseResponse();
+            resp.setFoodName(obj.path("food_name").asText());
+            resp.setQuantity(obj.path("quantity").asText());
+            resp.setCaloriesKcal(obj.path("calories_kcal").asInt());
+            resp.setCaloriesMinKcal(obj.path("calories_min_kcal").asInt(resp.getCaloriesKcal()));
+            resp.setCaloriesMaxKcal(obj.path("calories_max_kcal").asInt(resp.getCaloriesKcal()));
+            resp.setKjValue((float) obj.path("kj_value").asDouble(resp.getCaloriesKcal() * 4.184));
+            resp.setFuzzy(obj.path("is_fuzzy").asBoolean(false));
+            resp.setConfidence(obj.path("confidence").asText("MEDIUM"));
+            resp.setProtein(obj.path("protein_g").asDouble(0));
+            resp.setCarbs(obj.path("carbs_g").asDouble(0));
+            resp.setFat(obj.path("fat_g").asDouble(0));
+            String mealType = obj.path("meal_type").asText(hintMealType);
+            resp.setMealType(mealType.isEmpty() ? hintMealType : mealType);
+            result.add(resp);
+        }
+        return result;
+    }
+
+    private String chatWithImage(String systemPrompt, String userText, String imageBase64) throws IOException {
+        java.util.List<java.util.Map<String, Object>> contentArr = java.util.List.of(
+            java.util.Map.of("type", "image_url", "image_url",
+                java.util.Map.of("url", "data:image/jpeg;base64," + imageBase64)),
+            java.util.Map.of("type", "text", "text", userText)
+        );
+        java.util.Map<String, Object> requestBody = new java.util.HashMap<>();
+        requestBody.put("model", visionModel);
+        requestBody.put("temperature", 0.2f);
+        requestBody.put("max_tokens", 800);
+        requestBody.put("messages", java.util.List.of(
+            java.util.Map.of("role", "system", "content", systemPrompt),
+            java.util.Map.of("role", "user", "content", contentArr)
+        ));
+
+        String body = mapper.writeValueAsString(requestBody);
+        Request request = new Request.Builder()
+                .url(apiUrl)
+                .addHeader("Authorization", "Bearer " + apiKey)
+                .addHeader("Content-Type", "application/json")
+                .post(RequestBody.create(body, MediaType.parse("application/json")))
+                .build();
+
+        try (Response response = httpClient.newCall(request).execute()) {
+            String responseBody = response.body().string();
+            JsonNode root = mapper.readTree(responseBody);
+            if (root.has("error")) throw new IOException("GLM-4V error: " + root.get("error").toString());
+            return root.path("choices").get(0).path("message").path("content").asText();
+        }
     }
 
     public String recommendExercise(UserProfile profile) throws IOException {

@@ -30,6 +30,7 @@ public class HermesAgentService {
     private final ExerciseRecordService exerciseService;
     private final WeightRecordService weightService;
     private final UserProfileService profileService;
+    private final com.healthclaw.server.service.FoodKnowledgeService knowledgeService;
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static final String INTENT_PROMPT = """
@@ -60,12 +61,14 @@ public class HermesAgentService {
 
     public HermesAgentService(AiService aiService, FoodRecordService foodService,
                                ExerciseRecordService exerciseService, WeightRecordService weightService,
-                               UserProfileService profileService) {
+                               UserProfileService profileService,
+                               com.healthclaw.server.service.FoodKnowledgeService knowledgeService) {
         this.aiService = aiService;
         this.foodService = foodService;
         this.exerciseService = exerciseService;
         this.weightService = weightService;
         this.profileService = profileService;
+        this.knowledgeService = knowledgeService;
     }
 
     public AgentResponse process(String message, String date) {
@@ -135,7 +138,10 @@ public class HermesAgentService {
 
     private AgentResponse handleFood(IntentResult intent, String date) throws Exception {
         String text = intent.getFoodText() != null ? intent.getFoodText() : intent.getRawMessage();
-        List<FoodParseResponse> foods = aiService.parseFoodList(text);
+        List<String> keywords = java.util.Arrays.stream(text.split("[，,、和跟还有加上\\s]+"))
+                .map(String::trim).filter(s -> s.length() >= 2).collect(Collectors.toList());
+        String hint = knowledgeService.buildReferenceHint(keywords);
+        List<FoodParseResponse> foods = aiService.parseFoodList(text, hint);
         if (foods.isEmpty()) return AgentResponse.of("FOOD_RECORD", "没解析出食物，可以说得更具体吗？", "识别到饮食意图，但解析结果为空");
 
         int total = 0;

@@ -10,9 +10,11 @@ import java.util.List;
 public class FoodRecordService {
 
     private final FoodRecordRepository repo;
+    private final FoodKnowledgeService knowledgeService;
 
-    public FoodRecordService(FoodRecordRepository repo) {
+    public FoodRecordService(FoodRecordRepository repo, FoodKnowledgeService knowledgeService) {
         this.repo = repo;
+        this.knowledgeService = knowledgeService;
     }
 
     public List<FoodRecord> getByDate(String date) {
@@ -25,7 +27,9 @@ public class FoodRecordService {
 
     public FoodRecord save(FoodRecord record) {
         record.setRecordTimestamp(System.currentTimeMillis());
-        return repo.save(record);
+        FoodRecord saved = repo.save(record);
+        knowledgeService.learn(saved);
+        return saved;
     }
 
     public void delete(Long id) {
