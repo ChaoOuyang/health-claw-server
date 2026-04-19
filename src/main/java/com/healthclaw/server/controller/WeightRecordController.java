@@ -31,6 +31,12 @@ public class WeightRecordController {
         return ApiResponse.ok(service.upsert(record));
     }
 
+    @DeleteMapping("/{id}")
+    public ApiResponse<Void> deleteWeight(@PathVariable Long id) {
+        service.delete(id);
+        return ApiResponse.ok(null);
+    }
+
     @GetMapping("/predict")
     public ApiResponse<WeightPredictResponse> predict() {
         List<WeightRecord> recent = service.getRecentForPrediction();

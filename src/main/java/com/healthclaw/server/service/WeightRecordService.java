@@ -35,6 +35,10 @@ public class WeightRecordService {
         return repo.save(record);
     }
 
+    public void delete(Long id) {
+        repo.deleteById(id);
+    }
+
     public List<WeightRecord> getRecentForPrediction() {
         List<WeightRecord> desc = repo.findTop14ByOrderByRecordDateDesc();
         java.util.Collections.reverse(desc); // 改为升序返回

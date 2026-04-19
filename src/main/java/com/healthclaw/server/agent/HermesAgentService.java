@@ -16,7 +16,9 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 @Service
 public class HermesAgentService {
@@ -31,22 +33,21 @@ public class HermesAgentService {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private static final String INTENT_PROMPT = """
-            你是健康记录助手，分析用户输入的意图，返回严格 JSON，不含其他文字。
+            你是健康记录助手，分析用户输入包含哪些类型的信息，返回严格 JSON，不含其他文字。
 
-            意图类型（intent 字段）：
-            - FOOD_RECORD：记录饮食（包括同时提到多个餐次的情况）
-            - EXERCISE_RECORD：记录运动
-            - FOOD_AND_EXERCISE：同时包含饮食和运动
-            - WEIGHT_RECORD：记录体重
+            tags 数组取值（可同时包含多个）：
+            - FOOD：包含饮食记录（可跨多个餐次）
+            - EXERCISE：包含运动记录
+            - WEIGHT：包含体重记录
             - DELETE_FOOD：删除某条饮食记录（含"删掉""去掉""取消""撤销"等词，且指向食物）
             - DELETE_EXERCISE：删除某条运动记录（含"删掉""去掉""取消""撤销"等词，且指向运动）
             - QUERY_TODAY：查询今日数据
             - DAILY_COMMENT：请求 AI 点评/总结
-            - UNKNOWN：无法识别
+            - UNKNOWN：完全无法识别时单独使用
 
             返回格式：
             {
-              "intent": "...",
+              "tags": ["TAG1", "TAG2"],
               "food_text": "完整的饮食描述原文（保留所有餐次和食物信息），无则null",
               "exercise_text": "运动相关描述，无则null",
               "meal_type": "仅当所有食物属于同一餐次时填写 BREAKFAST|LUNCH|DINNER|SNACK，涉及多个餐次则填null",
@@ -89,7 +90,12 @@ public class HermesAgentService {
 
         JsonNode node = mapper.readTree(raw.substring(start, end + 1));
         IntentResult result = new IntentResult();
-        result.setIntent(node.path("intent").asText("UNKNOWN"));
+        List<String> tags = new ArrayList<>();
+        JsonNode tagsNode = node.path("tags");
+        if (tagsNode.isArray()) {
+            tagsNode.forEach(t -> tags.add(t.asText()));
+        }
+        result.setTags(tags.isEmpty() ? List.of("UNKNOWN") : tags);
         result.setFoodText(nullIfEmpty(node.path("food_text").asText(null)));
         result.setExerciseText(nullIfEmpty(node.path("exercise_text").asText(null)));
         result.setMealType(nullIfEmpty(node.path("meal_type").asText(null)));
@@ -101,17 +107,30 @@ public class HermesAgentService {
     }
 
     private AgentResponse route(IntentResult intent, String date) throws Exception {
-        return switch (intent.getIntent()) {
-            case "FOOD_RECORD" -> handleFood(intent, date);
-            case "EXERCISE_RECORD" -> handleExercise(intent, date);
-            case "FOOD_AND_EXERCISE" -> handleFoodAndExercise(intent, date);
-            case "WEIGHT_RECORD" -> handleWeight(intent, date);
-            case "DELETE_FOOD" -> handleDeleteFood(intent, date);
-            case "DELETE_EXERCISE" -> handleDeleteExercise(intent, date);
-            case "QUERY_TODAY" -> handleQueryToday(date);
-            case "DAILY_COMMENT" -> handleDailyComment(date);
-            default -> AgentResponse.of("UNKNOWN", "没听清楚，可以说'记录午饭吃了什么'或者'今天跑了多久'？");
-        };
+        List<String> tags = intent.getTags();
+
+        if (tags.contains("UNKNOWN") || tags.isEmpty()) {
+            return AgentResponse.of("UNKNOWN", "没听清楚，可以说'记录午饭吃了什么'或者'今天跑了多久'？");
+        }
+        if (tags.contains("QUERY_TODAY"))     return handleQueryToday(date);
+        if (tags.contains("DAILY_COMMENT"))   return handleDailyComment(date);
+        if (tags.contains("DELETE_FOOD"))     return handleDeleteFood(intent, date);
+        if (tags.contains("DELETE_EXERCISE")) return handleDeleteExercise(intent, date);
+
+        List<AgentResponse> responses = new ArrayList<>();
+        if (tags.contains("FOOD"))     responses.add(handleFood(intent, date));
+        if (tags.contains("EXERCISE")) responses.add(handleExercise(intent, date));
+        if (tags.contains("WEIGHT"))   responses.add(handleWeight(intent, date));
+
+        if (responses.isEmpty()) {
+            return AgentResponse.of("UNKNOWN", "没听清楚，可以说'记录午饭吃了什么'或者'今天跑了多久'？");
+        }
+        String combinedTag = tags.stream()
+                .filter(t -> List.of("FOOD", "EXERCISE", "WEIGHT").contains(t))
+                .collect(Collectors.joining("_AND_"));
+        String reply = responses.stream().map(AgentResponse::getReply).collect(Collectors.joining("\n"));
+        String reasoning = responses.stream().map(AgentResponse::getReasoning).collect(Collectors.joining("\n"));
+        return AgentResponse.of(combinedTag, reply, reasoning);
     }
 
     private AgentResponse handleFood(IntentResult intent, String date) throws Exception {
@@ -171,14 +190,6 @@ public class HermesAgentService {
         return AgentResponse.of("EXERCISE_RECORD",
                 "已记录：" + sb.toString().trim() + "，消耗 " + total + " kcal ✓",
                 reasoning.toString());
-    }
-
-    private AgentResponse handleFoodAndExercise(IntentResult intent, String date) throws Exception {
-        AgentResponse foodResp = handleFood(intent, date);
-        AgentResponse exResp = handleExercise(intent, date);
-        return AgentResponse.of("FOOD_AND_EXERCISE",
-                foodResp.getReply() + "\n" + exResp.getReply(),
-                foodResp.getReasoning() + "\n" + exResp.getReasoning());
     }
 
     private AgentResponse handleWeight(IntentResult intent, String date) {
@@ -292,8 +303,8 @@ public class HermesAgentService {
     }
 
     private String resolveMealType(String fromAi, String fromIntent) {
-        if (fromIntent != null && !fromIntent.isBlank()) return fromIntent;
         if (fromAi != null && !fromAi.isBlank()) return fromAi;
+        if (fromIntent != null && !fromIntent.isBlank()) return fromIntent;
         return "BREAKFAST";
     }
 

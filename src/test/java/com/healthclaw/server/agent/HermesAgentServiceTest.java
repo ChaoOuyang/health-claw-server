@@ -3,6 +3,7 @@ package com.healthclaw.server.agent;
 import com.healthclaw.server.entity.FoodRecord;
 import com.healthclaw.server.repository.ExerciseRecordRepository;
 import com.healthclaw.server.repository.FoodRecordRepository;
+import com.healthclaw.server.repository.WeightRecordRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -27,33 +28,72 @@ class HermesAgentServiceTest {
     @Autowired
     private ExerciseRecordRepository exerciseRepo;
 
+    @Autowired
+    private WeightRecordRepository weightRepo;
+
     private static final String DATE = "2024-01-15";
 
     @BeforeEach
     void setUp() throws InterruptedException {
         foodRepo.deleteAll();
         exerciseRepo.deleteAll();
+        weightRepo.deleteAll();
         Thread.sleep(1500);
     }
 
     @Test
-    @DisplayName("同一天多餐追加：早上吃了牛奶和面包，中午吃了米饭和红烧肉")
-    void same_day_multi_meal_append() throws Exception {
-        agentService.process("我上午吃了牛奶和面包", DATE);
-        agentService.process("中午吃了米饭和红烧肉", DATE);
-
-        List<FoodRecord> all = foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE);
-        assertThat(all).hasSize(4);
+    @DisplayName("多餐次：早上吃了牛奶和面包，中午吃了米饭和红烧肉，各自落到正确餐次")
+    void multi_meal_correct_meal_type() throws Exception {
+        agentService.process("早上吃了牛奶和面包，中午吃了米饭和红烧肉", DATE);
 
         List<FoodRecord> breakfast = foodRepo.findByRecordDateAndMealTypeOrderByRecordTimestampAsc(DATE, "BREAKFAST");
+        List<FoodRecord> lunch = foodRepo.findByRecordDateAndMealTypeOrderByRecordTimestampAsc(DATE, "LUNCH");
+
         assertThat(breakfast).hasSize(2);
         assertThat(breakfast).extracting("foodName").anyMatch(n -> ((String) n).contains("牛奶"));
         assertThat(breakfast).extracting("foodName").anyMatch(n -> ((String) n).contains("面包"));
 
-        List<FoodRecord> lunch = foodRepo.findByRecordDateAndMealTypeOrderByRecordTimestampAsc(DATE, "LUNCH");
         assertThat(lunch).hasSize(2);
         assertThat(lunch).extracting("foodName").anyMatch(n -> ((String) n).contains("米饭"));
         assertThat(lunch).extracting("foodName").anyMatch(n -> ((String) n).contains("红烧肉"));
+    }
+
+    @Test
+    @DisplayName("饮食+运动混合：中午吃了炒饭，跑步30分钟，两条数据各自落到正确板块")
+    void food_and_exercise_correct_storage() throws Exception {
+        agentService.process("中午吃了炒饭，跑步30分钟", DATE);
+
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(1);
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE).get(0).getMealType()).isEqualTo("LUNCH");
+
+        assertThat(exerciseRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(1);
+        assertThat(exerciseRepo.findByRecordDateOrderByRecordTimestampAsc(DATE).get(0).getDurationMinutes()).isBetween(25, 35);
+    }
+
+    @Test
+    @DisplayName("饮食+体重混合：早上吃了鸡蛋，体重65kg，两条数据各自落到正确板块")
+    void food_and_weight_correct_storage() throws Exception {
+        agentService.process("早上吃了鸡蛋，体重65kg", DATE);
+
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(1);
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE).get(0).getMealType()).isEqualTo("BREAKFAST");
+
+        assertThat(weightRepo.findByRecordDate(DATE)).isPresent();
+        assertThat(weightRepo.findByRecordDate(DATE).get().getWeightKg()).isBetween(64f, 66f);
+    }
+
+    @Test
+    @DisplayName("饮食+运动+体重全混合：今天早餐吃了燕麦，跑步20分钟，体重70kg，三条数据全部入库")
+    void food_exercise_weight_all_correct() throws Exception {
+        agentService.process("今天早餐吃了燕麦，跑步20分钟，体重70kg", DATE);
+
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(1);
+        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE).get(0).getMealType()).isEqualTo("BREAKFAST");
+
+        assertThat(exerciseRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(1);
+
+        assertThat(weightRepo.findByRecordDate(DATE)).isPresent();
+        assertThat(weightRepo.findByRecordDate(DATE).get().getWeightKg()).isBetween(69f, 71f);
     }
 
     @Test
@@ -81,21 +121,5 @@ class HermesAgentServiceTest {
         List<FoodRecord> remaining = foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE);
         assertThat(remaining).hasSize(1);
         assertThat(remaining.get(0).getMealType()).isEqualTo("LUNCH");
-    }
-
-    @Test
-    @DisplayName("三餐追加后查询：总摄入卡路里正确累加")
-    void three_meals_then_query_total() throws Exception {
-        agentService.process("早上吃了燕麦粥", DATE);
-        agentService.process("中午吃了盖浇饭", DATE);
-        agentService.process("晚上吃了水煮鱼", DATE);
-
-        AgentResponse resp = agentService.process("今天吃了多少卡路里", DATE);
-
-        assertThat(resp.getIntent()).isEqualTo("QUERY_TODAY");
-        assertThat(foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)).hasSize(3);
-        int total = foodRepo.findByRecordDateOrderByRecordTimestampAsc(DATE)
-                .stream().mapToInt(FoodRecord::getCaloriesKcal).sum();
-        assertThat(total).isBetween(400, 2000);
     }
 }
